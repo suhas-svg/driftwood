@@ -86,15 +86,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.state = Follower
 	rf.resetElectionTimer()
 
-	// TODO(week 3), "AppendEntries RPC: Receiver implementation":
-	//   4. Reply false if the log has no entry at PrevLogIndex with PrevLogTerm.
-	//   5. For each new entry, if an existing entry conflicts (same index,
-	//      different term), truncate from there. Only truncate on a CONFLICT;
-	//      a stale, matching AppendEntries must not shorten the log.
-	//   6. Append any entries not already present, then persist.
-	//   7. If LeaderCommit > commitIndex, set
-	//      commitIndex = min(LeaderCommit, index of last new entry).
-	reply.Success = false
+	// Consistency check: our log must contain the entry just before the new
+	// ones. On failure, tell the leader where to back up to.
+	if args.PrevLogIndex > rf.lastLogIndex() {
+		reply.ConflictTerm = -1 // our log is too short
+		reply.ConflictIndex = rf.lastLogIndex() + 1
+		return
+	}
+	if term := rf.log[args.PrevLogIndex].Term; term != args.PrevLogTerm {
+		// Point at the first entry of the conflicting term so the leader
+		// can skip the whole term.
+		first := args.PrevLogIndex
+		for first > 1 && rf.log[first-1].Term == term {
+			first--
+		}
+		reply.ConflictTerm = term
+		reply.ConflictIndex = first
+		return
+	}
+
+	// Merge the new entries. Truncate only at the first real conflict: an
+	// old, delayed AppendEntries whose entries all match must not cut off
+	// entries that a newer one already appended.
+	changed := false
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx <= rf.lastLogIndex() && rf.log[idx].Term == entry.Term {
+			continue
+		}
+		rf.log = append(rf.log[:idx:idx], args.Entries[i:]...)
+		changed = true
+		break
+	}
+	if changed {
+		rf.persist()
+	}
+	reply.Success = true
+
+	// Commit no further than what this RPC proved we share with the leader;
+	// entries past that may still be stale leftovers from an old term.
+	lastNew := args.PrevLogIndex + len(args.Entries)
+	if commit := min(args.LeaderCommit, lastNew); commit > rf.commitIndex {
+		rf.commitIndex = commit
+		rf.applyCond.Signal()
+	}
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {

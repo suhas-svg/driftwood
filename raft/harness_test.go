@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +19,8 @@ type cluster struct {
 	persisters []*Persister
 	connected  []bool
 	applyChs   []chan ApplyMsg
+	applied    []map[int]any // per node: log index -> command it applied there
+	applyErr   string        // first safety violation seen by the apply checker
 	start      time.Time
 }
 
@@ -31,6 +34,7 @@ func newCluster(t *testing.T, n int, reliable bool) *cluster {
 		persisters: make([]*Persister, n),
 		connected:  make([]bool, n),
 		applyChs:   make([]chan ApplyMsg, n),
+		applied:    make([]map[int]any, n),
 		start:      time.Now(),
 	}
 	if !reliable {
@@ -55,6 +59,7 @@ func (c *cluster) startNode(i int) {
 	persister := c.persisters[i]
 	applyCh := make(chan ApplyMsg, 1000)
 	c.applyChs[i] = applyCh
+	c.applied[i] = map[int]any{} // a restarted node replays its log from the start
 	c.mu.Unlock()
 
 	peers := make([]Peer, c.n)
@@ -68,7 +73,7 @@ func (c *cluster) startNode(i int) {
 	c.mu.Unlock()
 	c.net.Register(i, rf)
 
-	go c.drain(applyCh)
+	go c.checkApplies(i, applyCh)
 }
 
 // crash kills node i. Its persister survives for a later startNode.
@@ -83,11 +88,140 @@ func (c *cluster) crash(i int) {
 	}
 }
 
-// drain discards applied messages for now. Week 3 replaces this with a checker
-// that every node applies the same command at each index.
-func (c *cluster) drain(ch chan ApplyMsg) {
-	for range ch {
+// checkApplies records what node i applies and checks the two safety rules
+// the service depends on: entries arrive in index order with no gaps, and no
+// two nodes ever apply different commands at the same index.
+func (c *cluster) checkApplies(i int, ch chan ApplyMsg) {
+	for m := range ch {
+		if !m.CommandValid {
+			continue
+		}
+		c.mu.Lock()
+		if c.applyChs[i] != ch {
+			c.mu.Unlock()
+			continue // from a crashed incarnation of this node
+		}
+		if err := c.checkApplyLocked(i, m); err != "" && c.applyErr == "" {
+			c.applyErr = err
+		}
+		c.mu.Unlock()
 	}
+}
+
+func (c *cluster) checkApplyLocked(i int, m ApplyMsg) string {
+	idx := m.CommandIndex
+	if idx > 1 {
+		if _, ok := c.applied[i][idx-1]; !ok {
+			return fmt.Sprintf("node %d applied index %d before index %d", i, idx, idx-1)
+		}
+	}
+	if _, ok := c.applied[i][idx]; ok {
+		return fmt.Sprintf("node %d applied index %d twice", i, idx)
+	}
+	for j, log := range c.applied {
+		if other, ok := log[idx]; ok && other != m.Command {
+			return fmt.Sprintf("index %d: node %d applied %v but node %d applied %v",
+				idx, i, m.Command, j, other)
+		}
+	}
+	c.applied[i][idx] = m.Command
+	return ""
+}
+
+// failIfUnsafe stops the test if the apply checker saw a violation.
+func (c *cluster) failIfUnsafe() {
+	c.t.Helper()
+	c.mu.Lock()
+	err := c.applyErr
+	c.mu.Unlock()
+	if err != "" {
+		c.t.Fatal(err)
+	}
+}
+
+// nCommitted returns how many nodes have applied index, and the command there.
+func (c *cluster) nCommitted(index int) (int, any) {
+	c.t.Helper()
+	c.failIfUnsafe()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	var cmd any
+	for _, log := range c.applied {
+		if v, ok := log[index]; ok {
+			count++
+			cmd = v
+		}
+	}
+	return count, cmd
+}
+
+// one submits cmd and waits until at least expected nodes have applied it,
+// returning its index. It keeps looking for a leader for up to 10 seconds.
+// With retry, it resubmits if the first attempt does not commit, which is
+// what a real client does after a timeout.
+func (c *cluster) one(cmd any, expected int, retry bool) int {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	starts := 0
+	for time.Now().Before(deadline) {
+		index := -1
+		for k := 0; k < c.n; k++ {
+			starts = (starts + 1) % c.n
+			if rf := c.node(starts); rf != nil && c.isConnected(starts) {
+				if i, _, ok := rf.Start(cmd); ok {
+					index = i
+					break
+				}
+			}
+		}
+
+		if index != -1 {
+			// Someone claimed leadership. Give the entry time to commit.
+			for wait := time.Now(); time.Since(wait) < 2*time.Second; {
+				if n, got := c.nCommitted(index); n >= expected && got == cmd {
+					return index
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !retry {
+				c.t.Fatalf("one(%v) failed to reach agreement", cmd)
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	c.t.Fatalf("one(%v) failed to reach agreement within 10s", cmd)
+	return -1
+}
+
+// wait blocks until n nodes have applied index, and returns the command.
+// It gives up early, returning nil, if startTerm is set and some node moves
+// past it, since the entry may then never commit.
+func (c *cluster) wait(index, n, startTerm int) any {
+	c.t.Helper()
+	sleep := 10 * time.Millisecond
+	for iter := 0; iter < 30; iter++ {
+		if got, _ := c.nCommitted(index); got >= n {
+			break
+		}
+		time.Sleep(sleep)
+		sleep = min(2*sleep, time.Second)
+		if startTerm > -1 {
+			for i := 0; i < c.n; i++ {
+				if rf := c.node(i); rf != nil {
+					if t, _ := rf.GetState(); t > startTerm {
+						return nil
+					}
+				}
+			}
+		}
+	}
+	got, cmd := c.nCommitted(index)
+	if got < n {
+		c.t.Fatalf("only %d nodes committed index %d, wanted %d", got, index, n)
+	}
+	return cmd
 }
 
 func (c *cluster) connect(i int) {
@@ -107,6 +241,11 @@ func (c *cluster) disconnect(i int) {
 func (c *cluster) cleanup() {
 	for i := 0; i < c.n; i++ {
 		c.crash(i)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.applyErr != "" {
+		c.t.Error(c.applyErr)
 	}
 }
 

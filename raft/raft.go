@@ -76,6 +76,7 @@ type Raft struct {
 	// Volatile state on all servers.
 	commitIndex int
 	lastApplied int
+	applyCond   *sync.Cond // signaled when commitIndex advances; uses rf.mu
 
 	// Volatile state on leaders, reinitialized after each election.
 	nextIndex  []int
@@ -99,10 +100,12 @@ func Make(peers []Peer, me int, persister *Persister, applyCh chan<- ApplyMsg) *
 		log:       []LogEntry{{Term: 0}},
 		state:     Follower,
 	}
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.readPersist(persister.ReadRaftState())
 	rf.resetElectionTimer()
 
 	go rf.ticker()
+	go rf.applier()
 	return rf
 }
 
@@ -123,12 +126,46 @@ func (rf *Raft) Start(command any) (index, term int, isLeader bool) {
 	if rf.state != Leader {
 		return -1, rf.currentTerm, false
 	}
-	// TODO(week 3): append to the log, persist, and kick off replication.
-	return -1, rf.currentTerm, true
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	rf.persist()
+	rf.matchIndex[rf.me] = rf.lastLogIndex()
+	// Replicate now rather than waiting for the next heartbeat.
+	rf.broadcastAppendEntries()
+	return rf.lastLogIndex(), rf.currentTerm, true
 }
 
 // Kill stops the node. Long-running goroutines should check killed() and exit.
-func (rf *Raft) Kill() { rf.dead.Store(true) }
+func (rf *Raft) Kill() {
+	rf.dead.Store(true)
+	rf.mu.Lock()
+	rf.applyCond.Broadcast() // wake the applier so it can exit
+	rf.mu.Unlock()
+}
+
+// applier delivers committed entries on applyCh, in log order, exactly once.
+// It is the only goroutine that sends on applyCh, which keeps the order
+// straight, and it never holds rf.mu while sending, because the service on
+// the other end may be calling into Raft.
+func (rf *Raft) applier() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.killed() {
+		if rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+			continue
+		}
+		rf.lastApplied++
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied].Command,
+			CommandIndex: rf.lastApplied,
+			CommandTerm:  rf.log[rf.lastApplied].Term,
+		}
+		rf.mu.Unlock()
+		rf.applyCh <- msg
+		rf.mu.Lock()
+	}
+}
 
 func (rf *Raft) killed() bool { return rf.dead.Load() }
 
@@ -225,40 +262,9 @@ func (rf *Raft) heartbeatLoop(term int) {
 			rf.mu.Unlock()
 			return
 		}
-		rf.broadcastHeartbeat()
+		rf.broadcastAppendEntries()
 		rf.mu.Unlock()
 		time.Sleep(heartbeatInterval)
-	}
-}
-
-// broadcastHeartbeat sends one round of empty AppendEntries. Caller holds rf.mu.
-func (rf *Raft) broadcastHeartbeat() {
-	term := rf.currentTerm
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		// TODO(week 3): send entries from nextIndex[i] instead of an empty
-		// list, and handle the reply's Success to advance or back up.
-		prev := rf.nextIndex[i] - 1
-		args := AppendEntriesArgs{
-			Term:         term,
-			LeaderID:     rf.me,
-			PrevLogIndex: prev,
-			PrevLogTerm:  rf.log[prev].Term,
-			LeaderCommit: rf.commitIndex,
-		}
-		go func(server int) {
-			var reply AppendEntriesReply
-			if !rf.sendAppendEntries(server, &args, &reply) {
-				return
-			}
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			if reply.Term > rf.currentTerm {
-				rf.becomeFollower(reply.Term)
-			}
-		}(i)
 	}
 }
 
