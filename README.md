@@ -15,7 +15,7 @@ A Raft consensus implementation and replicated key-value store in Go, built from
 
 ```bash
 go test ./sim/                              # network layer, passes today
-go test ./raft/ -run Election -count=100    # election, fails until you implement it
+go test ./raft/ -run Election -count=100    # leader election
 ```
 
 One passing run proves little. Raft bugs often show up about once in a few hundred runs, so loop the tests. On Linux/macOS add `-race`; on Windows `-race` needs a C compiler (gcc via MSYS2 or similar).
@@ -25,7 +25,7 @@ One passing run proves little. Raft bugs often show up about once in a few hundr
 | Week | Goal | Done when |
 |---|---|---|
 | 1 | Read the paper, simulated network + RPC layer | `go test ./sim/` passes ✅ |
-| 2 | Leader election | `go test ./raft -run Election -count=500` passes |
+| 2 | Leader election | `go test ./raft -run Election -count=500` passes ✅ |
 | 3 | Log replication + commit | Nodes agree on the log under drops and partitions |
 | 4 | Persistence + crash recovery | Survives random crash/restart tests |
 | 5 | KV service, client dedup, linearizable reads | Porcupine passes on thousands of randomized runs |

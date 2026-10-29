@@ -14,4 +14,4 @@ jobs:
           go-version-file: go.mod
       - run: go vet ./...
       - run: go test -race -count=5 ./sim/
-      # Add ./raft/ here once election passes reliably.
+      - run: go test -race -count=3 ./raft/

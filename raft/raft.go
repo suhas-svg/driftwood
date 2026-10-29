@@ -154,20 +154,112 @@ func (rf *Raft) resetElectionTimer() {
 	rf.electionDelay = electionTimeoutMin + time.Duration(rand.Int63n(spread))
 }
 
-// startElection turns this node into a candidate and asks for votes.
-// Caller holds rf.mu.
+// startElection turns this node into a candidate and asks for votes
+// (Figure 2, "Rules for Servers: Candidates"). Caller holds rf.mu.
 func (rf *Raft) startElection() {
-	// TODO(week 2), from Figure 2 "Rules for Servers: Candidates":
-	//   1. Increment currentTerm, become Candidate, vote for self, persist.
-	//   2. Reset the election timer.
-	//   3. Send RequestVote to every other peer in its own goroutine.
-	//      Do NOT hold rf.mu while calling peers[i].Call.
-	//   4. When a reply comes back, re-lock and check that you are still a
-	//      Candidate in the same term before counting it. Stale replies happen.
-	//   5. If a reply carries a higher term, step down to Follower.
-	//   6. With votes from a majority (len(peers)/2 + 1), become Leader,
-	//      initialize nextIndex/matchIndex, and start sending heartbeats.
+	rf.state = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.persist()
 	rf.resetElectionTimer()
+
+	term := rf.currentTerm
+	args := RequestVoteArgs{
+		Term:         term,
+		CandidateID:  rf.me,
+		LastLogIndex: rf.lastLogIndex(),
+		LastLogTerm:  rf.lastLogTerm(),
+	}
+	votes := 1 // our own
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// One goroutine per peer, so a slow or dead peer never blocks the
+		// others, and rf.mu is never held across a Call.
+		go func(server int) {
+			var reply RequestVoteReply
+			if !rf.sendRequestVote(server, &args, &reply) {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				return
+			}
+			// The election may have ended, or a newer one started, while
+			// this RPC was in flight. Ignore replies that no longer count.
+			if rf.state != Candidate || rf.currentTerm != term || !reply.VoteGranted {
+				return
+			}
+			votes++
+			if votes > len(rf.peers)/2 {
+				rf.becomeLeader()
+			}
+		}(i)
+	}
+}
+
+// becomeLeader takes over after winning an election. Caller holds rf.mu.
+func (rf *Raft) becomeLeader() {
+	rf.state = Leader
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.peers {
+		rf.nextIndex[i] = rf.lastLogIndex() + 1
+	}
+	rf.matchIndex[rf.me] = rf.lastLogIndex()
+	go rf.heartbeatLoop(rf.currentTerm)
+}
+
+// heartbeatLoop sends empty AppendEntries to every peer until this node
+// stops leading term. Heartbeats go out at once on election so followers
+// stop campaigning before their timers fire.
+func (rf *Raft) heartbeatLoop(term int) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state != Leader || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		rf.broadcastHeartbeat()
+		rf.mu.Unlock()
+		time.Sleep(heartbeatInterval)
+	}
+}
+
+// broadcastHeartbeat sends one round of empty AppendEntries. Caller holds rf.mu.
+func (rf *Raft) broadcastHeartbeat() {
+	term := rf.currentTerm
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		// TODO(week 3): send entries from nextIndex[i] instead of an empty
+		// list, and handle the reply's Success to advance or back up.
+		prev := rf.nextIndex[i] - 1
+		args := AppendEntriesArgs{
+			Term:         term,
+			LeaderID:     rf.me,
+			PrevLogIndex: prev,
+			PrevLogTerm:  rf.log[prev].Term,
+			LeaderCommit: rf.commitIndex,
+		}
+		go func(server int) {
+			var reply AppendEntriesReply
+			if !rf.sendAppendEntries(server, &args, &reply) {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+			}
+		}(i)
+	}
 }
 
 // becomeFollower steps down when we see a higher term. Caller holds rf.mu.
