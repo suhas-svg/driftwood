@@ -11,13 +11,14 @@ A Raft consensus implementation and replicated key-value store in Go, built from
 | `raft/harness_test.go` | Test cluster: start, crash, and disconnect nodes, check leader and term invariants, and check that every node applies the same command at each index. |
 | `raft/election_test.go` | Leader election tests (week 2). |
 | `raft/replication_test.go` | Log replication and commit tests (week 3). |
+| `raft/persistence_test.go` | Crash/restart and Figure 8 tests (week 4). |
 
 ## Running tests
 
 ```bash
 go test ./sim/                              # network layer, passes today
 go test ./raft/ -run Election -count=100    # leader election
-go test ./raft/ -count=20                   # everything, about 70s per run
+go test ./raft/ -count=20                   # everything, about 100s per run
 ```
 
 One passing run proves little. Raft bugs often show up about once in a few hundred runs, so loop the tests. On Linux/macOS add `-race`; on Windows `-race` needs a C compiler (gcc via MSYS2 or similar).
@@ -29,7 +30,7 @@ One passing run proves little. Raft bugs often show up about once in a few hundr
 | 1 | Read the paper, simulated network + RPC layer | `go test ./sim/` passes ✅ |
 | 2 | Leader election | `go test ./raft -run Election -count=500` passes ✅ |
 | 3 | Log replication + commit | Nodes agree on the log under drops and partitions ✅ |
-| 4 | Persistence + crash recovery | Survives random crash/restart tests |
+| 4 | Persistence + crash recovery | Survives random crash/restart tests ✅ |
 | 5 | KV service, client dedup, linearizable reads | Porcupine passes on thousands of randomized runs |
 | 6 | Snapshots / log compaction | Lagging followers catch up via `InstallSnapshot` |
 | 7+ | Real processes over TCP/gRPC, CLI, benchmarks | Kill a node live, writes keep working |

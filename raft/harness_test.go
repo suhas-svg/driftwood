@@ -81,12 +81,26 @@ func (c *cluster) crash(i int) {
 	c.mu.Lock()
 	rf := c.nodes[i]
 	c.nodes[i] = nil
+	c.applyChs[i] = nil // ignore anything the dying node still applies
 	c.mu.Unlock()
 	c.net.Unregister(i)
-	if rf != nil {
-		rf.Kill()
+	if rf == nil {
+		return
 	}
+	rf.Kill()
+
+	// Freeze the disk as of the crash. Goroutines of the killed node can
+	// still be running and calling persist; those writes go to the old
+	// Persister and must not leak into the next incarnation.
+	c.mu.Lock()
+	c.persisters[i] = c.persisters[i].Copy()
+	c.mu.Unlock()
 }
+
+// restart crashes node i if it is running and starts it again from its disk.
+func (c *cluster) restart(i int) { c.startNode(i) }
+
+func (c *cluster) running(i int) bool { return c.node(i) != nil }
 
 // checkApplies records what node i applies and checks the two safety rules
 // the service depends on: entries arrive in index order with no gaps, and no
