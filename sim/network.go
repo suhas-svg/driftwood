@@ -44,15 +44,20 @@ func New(seed int64) *Network {
 	}
 }
 
-// Register makes svc reachable as node id. Exported methods of the form
+// Register makes svcs reachable as node id. Exported methods of the form
 //
 //	func (s *T) Name(args *A, reply *R)
 //
-// become callable by name. Registering again replaces the previous service;
-// replies still in flight from the old one are discarded, which models a
+// become callable by name. Pass several services when one node runs more
+// than one, such as a Raft node and the KV server on top of it; their method
+// names must not collide. Registering again replaces the previous services;
+// replies still in flight from the old ones are discarded, which models a
 // crash followed by a restart.
-func (n *Network) Register(id NodeID, svc any) {
-	s := newService(svc)
+//
+// A node that only makes calls, such as a client, needs no Register, just
+// Connect.
+func (n *Network) Register(id NodeID, svcs ...any) {
+	s := newService(svcs...)
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.services[id] = s
@@ -201,35 +206,45 @@ func (n *Network) timeout() time.Duration {
 	return time.Duration(50+n.rng.Intn(50)) * time.Millisecond
 }
 
-// service holds the callable methods of one registered object.
+// service holds the callable methods of the objects registered on one node.
 type service struct {
-	rcvr    reflect.Value
-	methods map[string]reflect.Method
+	methods map[string]boundMethod
 }
 
-func newService(svc any) *service {
-	s := &service{rcvr: reflect.ValueOf(svc), methods: map[string]reflect.Method{}}
-	t := reflect.TypeOf(svc)
-	for i := 0; i < t.NumMethod(); i++ {
-		m := t.Method(i)
-		mt := m.Type
-		if mt.NumIn() == 3 && mt.NumOut() == 0 &&
-			mt.In(1).Kind() == reflect.Pointer && mt.In(2).Kind() == reflect.Pointer {
-			s.methods[m.Name] = m
+type boundMethod struct {
+	rcvr reflect.Value
+	m    reflect.Method
+}
+
+func newService(svcs ...any) *service {
+	s := &service{methods: map[string]boundMethod{}}
+	for _, svc := range svcs {
+		t := reflect.TypeOf(svc)
+		for i := 0; i < t.NumMethod(); i++ {
+			m := t.Method(i)
+			mt := m.Type
+			if mt.NumIn() != 3 || mt.NumOut() != 0 ||
+				mt.In(1).Kind() != reflect.Pointer || mt.In(2).Kind() != reflect.Pointer {
+				continue
+			}
+			if _, dup := s.methods[m.Name]; dup {
+				panic(fmt.Sprintf("sim: two services on one node both define %s", m.Name))
+			}
+			s.methods[m.Name] = boundMethod{rcvr: reflect.ValueOf(svc), m: m}
 		}
 	}
 	return s
 }
 
 func (s *service) dispatch(method string, reqBytes []byte) ([]byte, error) {
-	m, ok := s.methods[method]
+	b, ok := s.methods[method]
 	if !ok {
 		return nil, fmt.Errorf("unknown method %q", method)
 	}
-	args := reflect.New(m.Type.In(1).Elem())
-	reply := reflect.New(m.Type.In(2).Elem())
+	args := reflect.New(b.m.Type.In(1).Elem())
+	reply := reflect.New(b.m.Type.In(2).Elem())
 	decode(reqBytes, args.Interface())
-	m.Func.Call([]reflect.Value{s.rcvr, args, reply})
+	b.m.Func.Call([]reflect.Value{b.rcvr, args, reply})
 	return encode(reply.Interface()), nil
 }
 

@@ -15,3 +15,4 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=5 ./sim/
       - run: go test -race -count=2 -timeout 20m ./raft/
+      - run: go test -race -count=2 -timeout 20m -v ./kv/
