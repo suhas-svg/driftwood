@@ -13,6 +13,8 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go vet ./...
+      - run: go build ./cmd/driftwood
+      - run: go test -race -count=3 ./transport/
       - run: go test -race -count=5 ./sim/
       - run: go test -race -count=1 -timeout 30m ./raft/
       - run: go test -race -count=2 -timeout 20m -v ./kv/

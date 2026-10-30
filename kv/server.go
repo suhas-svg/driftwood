@@ -117,6 +117,22 @@ func (kv *Server) Command(args *CommandArgs, reply *CommandReply) {
 	}
 }
 
+// Status reports this server's view of itself. It does not go through the
+// log, so it answers even without a majority.
+func (kv *Server) Status(args *StatusArgs, reply *StatusReply) {
+	term, isLeader := kv.rf.GetState()
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	*reply = StatusReply{
+		ID:            kv.me,
+		Term:          term,
+		IsLeader:      isLeader,
+		LastApplied:   kv.lastApplied,
+		Keys:          len(kv.data),
+		RaftStateSize: kv.persister.RaftStateSize(),
+	}
+}
+
 // applier applies committed entries to the state machine, in log order.
 func (kv *Server) applier() {
 	for msg := range kv.applyCh {

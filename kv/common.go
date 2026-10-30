@@ -47,6 +47,19 @@ type CommandReply struct {
 	Value string // for Get
 }
 
+type StatusArgs struct{}
+
+// StatusReply describes one server, for operators and the CLI. It is not
+// linearizable: a server that thinks it leads may already have been replaced.
+type StatusReply struct {
+	ID            int
+	Term          int
+	IsLeader      bool
+	LastApplied   int
+	Keys          int
+	RaftStateSize int // bytes of persisted Raft state (log, term, vote)
+}
+
 func init() {
 	// Op travels inside raft.LogEntry.Command, an interface, so gob needs the
 	// concrete type registered for both RPCs and persistence.
