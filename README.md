@@ -47,9 +47,10 @@ Each server keeps its state in `data/<id>/state.bin` (change with `-data`). The 
 | Path | What it is |
 |---|---|
 | `sim/` | Simulated network. Every RPC goes through it, so tests control drops, delays, partitions, and crash/restart. |
-| `raft/` | The Raft node. `raft.go` holds state, elections, and the applier. `replicate.go` holds the leader side of replication and commit. `rpc.go` holds the RPC handlers, `persist.go` holds stable storage, and `snapshot.go` holds log compaction and `InstallSnapshot`. |
+| `raft/` | The Raft node. `raft.go` holds state, elections, and the applier. `replicate.go` holds the leader side of replication and commit. `rpc.go` holds the RPC handlers, `prevote.go` holds PreVote, `persist.go` holds stable storage, and `snapshot.go` holds log compaction and `InstallSnapshot`. |
 | `raft/harness_test.go` | Test cluster: start, crash, and disconnect nodes, check leader and term invariants, and check that every node applies the same command at each index. |
 | `raft/election_test.go` | Leader election tests (week 2). |
+| `raft/prevote_test.go` | PreVote: a follower cut off and then reconnected must not depose a working leader. |
 | `raft/replication_test.go` | Log replication and commit tests (week 3). |
 | `raft/persistence_test.go` | Crash/restart and Figure 8 tests (week 4). |
 | `raft/snapshot_test.go` | Snapshot and `InstallSnapshot` tests, including a follower 10,000 entries behind (week 6). |
@@ -61,6 +62,14 @@ Each server keeps its state in `data/<id>/state.bin` (change with `-data`). The 
 | `transport/transport_test.go` | Real TCP and disk tests: leader kill and recovery from the state file, full-cluster restart (week 7). |
 | `raft/persister.go` | Stable storage. In memory for the simulated tests; `NewFilePersister` writes each save to a temp file, fsyncs it, and renames it into place, with a checksum to reject a corrupt file. |
 | `cmd/driftwood/` | The CLI: `serve`, `get`, `put`, `append`, `status`, `bench`, `demo`. |
+
+## PreVote
+
+Without PreVote, a node cut off from the others times out again and again, adding 1 to its term each time. When it reconnects, its higher term forces the working leader to step down, and the cluster holds an election it didn't need.
+
+With PreVote (section 9.6 of Ongaro's thesis), a node whose election timer fires first asks the others: *would you vote for me in the next term?* Answering changes nobody's state. The node starts a real election only if a majority says yes. A node refuses if it is the leader, or if a leader contacted it within the minimum election timeout. Without that rule, in a 3-node cluster, one follower that missed a few heartbeats could win the other follower's pre-vote and depose a working leader.
+
+The "contacted by a leader" time is tracked separately from the election timer. A node resets its election timer when it starts its own pre-vote round. If that reset counted as hearing from a leader, two nodes that timed out together would keep refusing each other.
 
 ## How the KV store stays correct
 
@@ -121,6 +130,16 @@ One passing run proves little. Raft bugs often show up about once in a few hundr
 | 7+ | Real processes over TCP/gRPC, CLI, benchmarks | Kill a node live, writes keep working ✅ (TCP via `net/rpc`, with group commit) |
 
 The `TODO(week N)` comments in `raft/` mark where each milestone's code goes, with the matching rules from Figure 2 of the paper.
+
+Stretch goals:
+
+| Goal | Status |
+|---|---|
+| PreVote | ✅ |
+| Cluster membership changes | |
+| Sharding / Multi-Raft | |
+| Deterministic simulation testing | |
+| Blog post with a live-demo GIF | |
 
 ## References
 

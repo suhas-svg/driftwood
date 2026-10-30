@@ -84,6 +84,11 @@ func (s *raftService) RequestVote(a *raft.RequestVoteArgs, r *raft.RequestVoteRe
 	return nil
 }
 
+func (s *raftService) PreVote(a *raft.RequestVoteArgs, r *raft.RequestVoteReply) error {
+	s.rf.PreVote(a, r)
+	return nil
+}
+
 func (s *raftService) AppendEntries(a *raft.AppendEntriesArgs, r *raft.AppendEntriesReply) error {
 	s.rf.AppendEntries(a, r)
 	return nil

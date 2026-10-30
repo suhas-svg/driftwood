@@ -1,5 +1,7 @@
 package raft
 
+import "time"
+
 // RPC argument and reply types. Field names must be exported (capitalized)
 // or gob will silently drop them on the wire.
 
@@ -85,6 +87,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// has lost the election.
 	rf.state = Follower
 	rf.resetElectionTimer()
+	rf.leaderContact = time.Now()
 
 	// Entries at or before snapIndex are committed and already folded into our
 	// snapshot, so they match the leader by definition. Drop that part of a

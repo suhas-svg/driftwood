@@ -1,5 +1,7 @@
 package raft
 
+import "time"
+
 // Log compaction (section 7 of the paper). The service periodically hands
 // Raft a snapshot of its state, and Raft discards the log entries the
 // snapshot covers. A follower so far behind that the leader no longer has the
@@ -62,6 +64,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	rf.state = Follower
 	rf.resetElectionTimer()
+	rf.leaderContact = time.Now()
 
 	// A delayed or duplicate snapshot that we have already moved past.
 	// Installing it would roll back entries we have committed.

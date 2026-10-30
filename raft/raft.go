@@ -95,6 +95,8 @@ type Raft struct {
 	state         State
 	electionReset time.Time     // last time we heard from a valid leader or granted a vote
 	electionDelay time.Duration // randomized timeout for the current wait
+	electionEpoch int           // counts timer resets, so a pre-vote round can tell it is stale
+	leaderContact time.Time     // last AppendEntries or InstallSnapshot from a current leader
 
 	// Group commit (see logSaver). logDirty means the leader appended
 	// entries that are not on disk yet.
@@ -216,13 +218,13 @@ func (rf *Raft) applier() {
 
 func (rf *Raft) killed() bool { return rf.dead.Load() }
 
-// ticker starts an election whenever the election timeout passes without
-// word from a leader.
+// ticker starts a pre-vote round, and through it an election, whenever the
+// election timeout passes without word from a leader.
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.state != Leader && time.Since(rf.electionReset) >= rf.electionDelay {
-			rf.startElection()
+			rf.startPreVote()
 		}
 		rf.mu.Unlock()
 		time.Sleep(tickInterval)
@@ -234,6 +236,7 @@ func (rf *Raft) ticker() {
 // AppendEntries from the current leader, or start an election. Caller holds rf.mu.
 func (rf *Raft) resetElectionTimer() {
 	rf.electionReset = time.Now()
+	rf.electionEpoch++
 	spread := int64(electionTimeoutMax - electionTimeoutMin)
 	rf.electionDelay = electionTimeoutMin + time.Duration(rand.Int63n(spread))
 }
