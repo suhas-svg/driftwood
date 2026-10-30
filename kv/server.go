@@ -130,6 +130,7 @@ func (kv *Server) Status(args *StatusArgs, reply *StatusReply) {
 		LastApplied:   kv.lastApplied,
 		Keys:          len(kv.data),
 		RaftStateSize: kv.persister.RaftStateSize(),
+		Saves:         kv.persister.SaveCount(),
 	}
 }
 

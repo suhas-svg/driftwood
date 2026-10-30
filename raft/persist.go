@@ -26,20 +26,74 @@ type persistentState struct {
 // Commands inside LogEntry are interfaces, so the service must gob.Register
 // every concrete command type it uses.
 func (rf *Raft) persist() {
+	state, snapshot, version := rf.encodeState()
+	rf.save(state, snapshot, version)
+}
+
+// encodeState captures the persistent state, tagged with a version that
+// increases with every capture. Caller holds rf.mu.
+func (rf *Raft) encodeState() (state, snapshot []byte, version uint64) {
 	var buf bytes.Buffer
-	state := persistentState{
+	s := persistentState{
 		CurrentTerm: rf.currentTerm,
 		VotedFor:    rf.votedFor,
 		Log:         rf.log,
 		SnapIndex:   rf.snapIndex,
 	}
-	if err := gob.NewEncoder(&buf).Encode(state); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(s); err != nil {
 		panic(fmt.Sprintf("raft %d: persist: %v", rf.me, err))
 	}
-	// Raft state and snapshot are saved in one step. Saving them separately
-	// would let a crash in between leave a log that starts after a snapshot
-	// the disk does not have.
-	rf.persister.Save(buf.Bytes(), rf.snapshot)
+	rf.stateVersion++
+	return buf.Bytes(), rf.snapshot, rf.stateVersion
+}
+
+// save writes one captured state to disk, unless a newer capture is already
+// there. The leader's background saves run without rf.mu, so a capture can
+// reach save after a later one (say, a vote) has been written; letting the
+// older one overwrite it would forget the vote.
+//
+// Raft state and snapshot are saved in one step. Saving them separately
+// would let a crash in between leave a log that starts after a snapshot the
+// disk does not have.
+func (rf *Raft) save(state, snapshot []byte, version uint64) {
+	rf.saveMu.Lock()
+	defer rf.saveMu.Unlock()
+	if version <= rf.savedVersion {
+		return
+	}
+	rf.persister.Save(state, snapshot)
+	rf.savedVersion = version
+}
+
+// logSaver is the leader's group commit. Start only appends to the log in
+// memory and wakes this goroutine, which saves everything appended since its
+// last save in one write, without holding rf.mu. Only then does the leader
+// count its own copy toward a majority (matchIndex[me]), so no entry commits
+// before the leader has it on disk. Followers still save before replying,
+// once per AppendEntries, and replicators batch those too.
+func (rf *Raft) logSaver() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for !rf.killed() {
+		if !rf.logDirty {
+			rf.saveCond.Wait()
+			continue
+		}
+		rf.logDirty = false
+		state, snapshot, version := rf.encodeState()
+		term, last := rf.currentTerm, rf.lastLogIndex()
+
+		rf.mu.Unlock()
+		rf.save(state, snapshot, version)
+		rf.mu.Lock()
+
+		// A leader never removes entries from its own log in its own term,
+		// so if we still lead that term, entries through last are on disk.
+		if rf.state == Leader && rf.currentTerm == term {
+			rf.matchIndex[rf.me] = max(rf.matchIndex[rf.me], last)
+			rf.advanceCommitIndex()
+		}
+	}
 }
 
 // readPersist restores state saved by persist. Called from Make.

@@ -103,6 +103,44 @@ func within(t *testing.T, d time.Duration, what string, f func()) {
 	}
 }
 
+// With many clients writing at once, the leader should save batches of log
+// entries, not one entry per save. Without group commit every operation
+// costs at least one leader save, since Gets go through the log too.
+func TestTCPGroupCommit(t *testing.T) {
+	c := newTCPCluster(t, 3)
+	leader := c.leader()
+	var before kv.StatusReply
+	c.nodes[leader].KV.Status(&kv.StatusArgs{}, &before)
+
+	const clients, perClient = 16, 25
+	within(t, 30*time.Second, "concurrent writes", func() {
+		done := make(chan struct{})
+		for k := 0; k < clients; k++ {
+			go func() {
+				ck := c.clerk()
+				for i := 0; i < perClient; i++ {
+					ck.Put(fmt.Sprintf("k%d-%d", k, i), "v")
+				}
+				done <- struct{}{}
+			}()
+		}
+		for k := 0; k < clients; k++ {
+			<-done
+		}
+	})
+
+	var after kv.StatusReply
+	c.nodes[leader].KV.Status(&kv.StatusArgs{}, &after)
+	if !after.IsLeader {
+		t.Skip("leadership changed during the test; save counts are not comparable")
+	}
+	ops, saves := clients*perClient, after.Saves-before.Saves
+	t.Logf("%d operations, %d leader saves (%.1f ops per save)", ops, saves, float64(ops)/float64(saves))
+	if saves*2 > ops {
+		t.Fatalf("leader saved %d times for %d operations; group commit should batch them", saves, ops)
+	}
+}
+
 func TestTCPBasic(t *testing.T) {
 	c := newTCPCluster(t, 3)
 	ck := c.clerk()

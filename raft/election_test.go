@@ -31,6 +31,16 @@ func TestInitialElection(t *testing.T) {
 	c.checkOneLeader()
 }
 
+// A one-node cluster is its own majority. It never gets a vote reply, so it
+// must notice it has won without one.
+func TestSingleNodeCluster(t *testing.T) {
+	c := newCluster(t, 1, true)
+	c.checkOneLeader()
+	for i := 1; i <= 5; i++ {
+		c.one(i*10, 1, false)
+	}
+}
+
 func TestReElection(t *testing.T) {
 	c := newCluster(t, 3, true)
 

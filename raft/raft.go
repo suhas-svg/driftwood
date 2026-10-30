@@ -95,6 +95,18 @@ type Raft struct {
 	state         State
 	electionReset time.Time     // last time we heard from a valid leader or granted a vote
 	electionDelay time.Duration // randomized timeout for the current wait
+
+	// Group commit (see logSaver). logDirty means the leader appended
+	// entries that are not on disk yet.
+	logDirty     bool
+	saveCond     *sync.Cond // wakes logSaver; uses rf.mu
+	stateVersion uint64     // bumped each time state is captured for saving
+	saveMu       sync.Mutex // serializes disk writes; held without rf.mu
+	savedVersion uint64     // version on disk; guarded by saveMu
+
+	// Replication triggers, one per follower, for the current term's
+	// replicators. Buffered, so a trigger never blocks and repeats coalesce.
+	replicate []chan struct{}
 }
 
 // Make creates a Raft node. peers[me] is this node. persister holds any state
@@ -113,11 +125,13 @@ func Make(peers []Peer, me int, persister *Persister, applyCh chan<- ApplyMsg) *
 		state:     Follower,
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.saveCond = sync.NewCond(&rf.mu)
 	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 	rf.resetElectionTimer()
 
 	go rf.ticker()
 	go rf.applier()
+	go rf.logSaver()
 	return rf
 }
 
@@ -139,10 +153,16 @@ func (rf *Raft) Start(command any) (index, term int, isLeader bool) {
 		return -1, rf.currentTerm, false
 	}
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
-	rf.persist()
-	rf.matchIndex[rf.me] = rf.lastLogIndex()
-	// Replicate now rather than waiting for the next heartbeat.
-	rf.broadcastAppendEntries()
+	// Group commit: logSaver writes this entry to disk along with any others
+	// that arrive meanwhile, and counts our copy only once it is saved.
+	rf.logDirty = true
+	rf.saveCond.Signal()
+	// Followers can store it in parallel with our own disk write.
+	for i := range rf.peers {
+		if i != rf.me {
+			rf.triggerReplication(i)
+		}
+	}
 	return rf.lastLogIndex(), rf.currentTerm, true
 }
 
@@ -151,6 +171,7 @@ func (rf *Raft) Kill() {
 	rf.dead.Store(true)
 	rf.mu.Lock()
 	rf.applyCond.Broadcast() // wake the applier so it can exit
+	rf.saveCond.Broadcast()  // and the log saver
 	rf.mu.Unlock()
 }
 
@@ -264,6 +285,10 @@ func (rf *Raft) startElection() {
 			}
 		}(i)
 	}
+	// A single-node cluster is its own majority; no reply will ever come.
+	if votes > len(rf.peers)/2 {
+		rf.becomeLeader()
+	}
 }
 
 // becomeLeader takes over after winning an election. Caller holds rf.mu.
@@ -274,7 +299,15 @@ func (rf *Raft) becomeLeader() {
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
 	}
+	// Everything in our log is already on disk: becoming a candidate saved it.
 	rf.matchIndex[rf.me] = rf.lastLogIndex()
+	rf.replicate = make([]chan struct{}, len(rf.peers))
+	for i := range rf.peers {
+		if i != rf.me {
+			rf.replicate[i] = make(chan struct{}, 1)
+			go rf.replicator(i, rf.currentTerm, rf.replicate[i])
+		}
+	}
 	go rf.heartbeatLoop(rf.currentTerm)
 }
 

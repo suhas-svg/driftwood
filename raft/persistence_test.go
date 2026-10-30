@@ -165,6 +165,85 @@ func TestPersistPartitionedCrash(t *testing.T) {
 	}
 }
 
+// ackPeer acknowledges every AppendEntries, as a follower that stored the
+// entries would.
+type ackPeer struct{}
+
+func (ackPeer) Call(method string, args, reply any) bool {
+	if method != "AppendEntries" {
+		return false
+	}
+	reply.(*AppendEntriesReply).Term = args.(*AppendEntriesArgs).Term
+	reply.(*AppendEntriesReply).Success = true
+	return true
+}
+
+// With group commit the leader saves its log in the background. It may count
+// its own copy toward a majority only once that save is done: in a 3-node
+// cluster where one follower has the entry and the other is down, committing
+// early would rest on a single durable copy, and the leader crashing before
+// its save would lose a committed entry.
+func TestLeaderCountsOwnCopyOnlyOnceSaved(t *testing.T) {
+	p := NewPersister()
+	rf := Make([]Peer{deadPeer{}, ackPeer{}, deadPeer{}}, 0, p, make(chan ApplyMsg, 100))
+	defer rf.Kill()
+	rf.mu.Lock()
+	rf.currentTerm = 1
+	rf.becomeLeader()
+	rf.mu.Unlock()
+
+	// From here on, the leader's disk writes hang until released.
+	release := make(chan struct{})
+	p.mu.Lock()
+	p.beforeSave = func() { <-release }
+	p.mu.Unlock()
+
+	index, _, ok := rf.Start("x")
+	if !ok {
+		t.Fatal("Start refused on the leader")
+	}
+	time.Sleep(300 * time.Millisecond) // plenty for the follower to acknowledge
+
+	rf.mu.Lock()
+	committed, followerHas := rf.commitIndex, rf.matchIndex[1]
+	rf.mu.Unlock()
+	if followerHas < index {
+		t.Fatalf("follower never acknowledged index %d", index)
+	}
+	if committed >= index {
+		close(release)
+		t.Fatalf("index %d committed with one follower's copy while the leader's save was still pending", index)
+	}
+
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rf.mu.Lock()
+		committed = rf.commitIndex
+		rf.mu.Unlock()
+		if committed >= index {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("index %d did not commit after the leader's save finished", index)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The leader's background save captures state under rf.mu but writes it
+// without the lock, so a later capture (a vote, say) can reach the disk
+// first. The older one arriving afterwards must not overwrite it.
+func TestOlderSaveNeverOverwritesNewer(t *testing.T) {
+	p := NewPersister()
+	rf := lonelyNode(t, p)
+	rf.save([]byte("newer"), nil, 1_000_002)
+	rf.save([]byte("older"), nil, 1_000_001)
+	if got := string(p.ReadRaftState()); got != "newer" {
+		t.Fatalf("disk holds %q; an older capture overwrote a newer one", got)
+	}
+}
+
 // TestFigure8CommitRule checks the commit rule directly, since the randomized
 // TestFigure8 below only rarely hits the exact crash timing that breaks it.
 //

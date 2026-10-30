@@ -25,6 +25,9 @@ type Persister struct {
 
 	path   string // state file; empty for memory only
 	noSync bool   // skip fsync (benchmarks only: a crash can lose acknowledged writes)
+	saves  int    // number of Save calls, to observe group commit
+
+	beforeSave func() // test hook: runs at the start of every Save
 }
 
 func NewPersister() *Persister { return &Persister{} }
@@ -68,8 +71,12 @@ func (p *Persister) Copy() *Persister {
 func (p *Persister) Save(raftState, snapshot []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.beforeSave != nil {
+		p.beforeSave()
+	}
 	p.raftState = clone(raftState)
 	p.snapshot = clone(snapshot)
+	p.saves++
 	if p.path != "" {
 		if err := p.writeFile(); err != nil {
 			// Raft cannot continue safely if it cannot persist: replying to an
@@ -172,6 +179,13 @@ func (p *Persister) RaftStateSize() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.raftState)
+}
+
+// SaveCount is how many times Save has been called.
+func (p *Persister) SaveCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.saves
 }
 
 func (p *Persister) ReadSnapshot() []byte {

@@ -89,35 +89,26 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.applyCond.Signal()
 }
 
-// sendSnapshotTo sends the current snapshot to a follower that needs entries
-// we no longer have. Caller holds rf.mu and is the leader.
-func (rf *Raft) sendSnapshotTo(server int) {
-	args := InstallSnapshotArgs{
-		Term:              rf.currentTerm,
-		LeaderID:          rf.me,
-		LastIncludedIndex: rf.snapIndex,
-		LastIncludedTerm:  rf.log[0].Term,
-		Data:              rf.snapshot,
+// sendSnapshot sends a snapshot (built by prepareSend) to a follower that
+// needs entries we no longer have, and handles the reply. Called without rf.mu.
+func (rf *Raft) sendSnapshot(server int, args *InstallSnapshotArgs) {
+	var reply InstallSnapshotReply
+	if !rf.peers[server].Call("InstallSnapshot", args, &reply) {
+		return
 	}
-	go func() {
-		var reply InstallSnapshotReply
-		if !rf.peers[server].Call("InstallSnapshot", &args, &reply) {
-			return
-		}
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if reply.Term > rf.currentTerm {
-			rf.becomeFollower(reply.Term)
-			return
-		}
-		if rf.state != Leader || rf.currentTerm != args.Term {
-			return
-		}
-		rf.matchIndex[server] = max(rf.matchIndex[server], args.LastIncludedIndex)
-		rf.nextIndex[server] = max(rf.nextIndex[server], args.LastIncludedIndex+1)
-		// Follow up with whatever entries came after the snapshot.
-		if rf.nextIndex[server] <= rf.lastLogIndex() {
-			rf.sendEntriesTo(server)
-		}
-	}()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower(reply.Term)
+		return
+	}
+	if rf.state != Leader || rf.currentTerm != args.Term {
+		return
+	}
+	rf.matchIndex[server] = max(rf.matchIndex[server], args.LastIncludedIndex)
+	rf.nextIndex[server] = max(rf.nextIndex[server], args.LastIncludedIndex+1)
+	// Follow up with whatever entries came after the snapshot.
+	if rf.nextIndex[server] <= rf.lastLogIndex() {
+		rf.triggerReplication(server)
+	}
 }

@@ -58,6 +58,7 @@ type StatusReply struct {
 	LastApplied   int
 	Keys          int
 	RaftStateSize int // bytes of persisted Raft state (log, term, vote)
+	Saves         int // disk writes since this process started
 }
 
 func init() {

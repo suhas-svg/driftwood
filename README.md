@@ -12,18 +12,18 @@ go build -o bin/driftwood ./cmd/driftwood
 `demo` starts 5 servers as separate processes and keeps 4 clients writing. After 4 seconds it hard-kills the leader, and after 10 seconds it restarts it. At the end it reads every client's key back and checks that every acknowledged write is there, exactly once, in order. One run on a Windows laptop:
 
 ```
-    3.5s     70 writes/s      250 total  leader 1
+    3.5s    224 writes/s      796 total  leader 4
 
-***   4.0s  hard-killed leader, server 1 (pid 16468)
+***   4.0s  hard-killed leader, server 4 (pid 10176)
 
-    4.0s     96 writes/s      298 total  leader -
-    4.5s      0 writes/s      298 total  leader -
-    5.0s     52 writes/s      324 total  leader 2
+    4.0s    222 writes/s      907 total  leader -
+    4.5s     52 writes/s      933 total  leader 2
+    5.0s    300 writes/s     1083 total  leader 2
     ...
-***  10.0s  restarted server 1; it recovers from disk and catches up
+***  10.0s  restarted server 4; it recovers from disk and catches up
     ...
-1198 writes acknowledged; read back all 4 keys: every write present, exactly once, in order.
-longest pause between acknowledged writes: 417ms (leader failure, election, client retry)
+3665 writes acknowledged; read back all 4 keys: every write present, exactly once, in order.
+longest pause between acknowledged writes: 372ms (leader failure, election, client retry)
 ```
 
 To run a cluster by hand, start each server in its own terminal, then use the client commands:
@@ -76,14 +76,23 @@ Each server keeps its state in `data/<id>/state.bin` (change with `-data`). The 
 
 ## Performance
 
-`driftwood bench` against 3 local servers on a Windows laptop, 16 clients, 50% reads:
+`driftwood bench` against 3 local servers on a Windows laptop, 50% reads, fsync on unless noted:
 
-| Setting | Throughput | p50 | p99 |
-|---|---|---|---|
-| fsync on (default) | 127 ops/s | 115 ms | 371 ms |
-| `-nosync` | 152 ops/s | 94 ms | 223 ms |
+| Version | Clients | Throughput | p50 | p99 |
+|---|---|---|---|---|
+| Before group commit | 16 | 127 ops/s | 115 ms | 371 ms |
+| Before group commit, `-nosync` | 16 | 152 ops/s | 94 ms | 223 ms |
+| **Group commit** | 16 | **828 ops/s** | 15 ms | 43 ms |
+| Group commit | 64 | 1,423 ops/s | 32 ms | 256 ms |
+| Group commit, `-nosync` | 16 | 938 ops/s | 15 ms | 43 ms |
 
-The limit is the persister, not the network: one client sees 13 ms per Put over TCP versus 0.3 ms on the simulated network. Every log entry costs one full `Save` on the leader and one on a follower before it commits: 3.2 ms with fsync, 1.1 ms without, because each `Save` rewrites the whole state file and renames it into place. The leader saves while holding Raft's lock, so entries commit roughly one at a time. Group commit, appending many entries and then saving once for the batch, is the standard fix. An append-only log file would also avoid rewriting the snapshot on every save.
+Every log entry has to be on disk on a majority before it commits, and one `Save` costs 3.2 ms with fsync on this machine (1.1 ms without), because it rewrites the whole state file and renames it into place. Before group commit, the leader saved each entry as `Start` received it, while holding Raft's lock, so entries committed roughly one at a time. Group commit batches those saves:
+
+- **Leader.** `Start` appends to the log in memory and returns. A background goroutine (`logSaver`) saves everything appended since its last save in one write, without holding the lock. The leader counts its own copy toward a majority only once that save is done, so nothing commits on fewer durable copies than before.
+- **Followers.** Each follower has a replicator with one `AppendEntries` in flight. Entries that arrive while a request is out go together in the next one, so a follower also saves once per batch.
+- **Ordering.** Saves are versioned. A background save that reaches the disk after a newer one, such as a vote, is skipped instead of overwriting it.
+
+With 16 clients the leader averages about 3 operations per save. The next step would be an append-only log file, so a save writes only the new entries instead of the whole log and snapshot.
 
 ## Running tests
 
@@ -107,9 +116,9 @@ One passing run proves little. Raft bugs often show up about once in a few hundr
 | 2 | Leader election | `go test ./raft -run Election -count=500` passes ✅ |
 | 3 | Log replication + commit | Nodes agree on the log under drops and partitions ✅ |
 | 4 | Persistence + crash recovery | Survives random crash/restart tests ✅ |
-| 5 | KV service, client dedup, linearizable reads | Porcupine passes on thousands of randomized runs. Built ✅; 104 of 104 full-suite runs so far |
+| 5 | KV service, client dedup, linearizable reads | Porcupine passes on thousands of randomized runs. Built ✅; 136 of 136 full-suite runs so far |
 | 6 | Snapshots / log compaction | Lagging followers catch up via `InstallSnapshot` ✅ |
-| 7+ | Real processes over TCP/gRPC, CLI, benchmarks | Kill a node live, writes keep working ✅ (TCP via `net/rpc`; group commit is next) |
+| 7+ | Real processes over TCP/gRPC, CLI, benchmarks | Kill a node live, writes keep working ✅ (TCP via `net/rpc`, with group commit) |
 
 The `TODO(week N)` comments in `raft/` mark where each milestone's code goes, with the matching rules from Figure 2 of the paper.
 
