@@ -86,6 +86,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.state = Follower
 	rf.resetElectionTimer()
 
+	// Entries at or before snapIndex are committed and already folded into our
+	// snapshot, so they match the leader by definition. Drop that part of a
+	// (delayed) request and check consistency at snapIndex instead.
+	if args.PrevLogIndex < rf.snapIndex {
+		skip := min(rf.snapIndex-args.PrevLogIndex, len(args.Entries))
+		args.Entries = args.Entries[skip:]
+		args.PrevLogIndex = rf.snapIndex
+		args.PrevLogTerm = rf.log[0].Term
+	}
+
 	// Consistency check: our log must contain the entry just before the new
 	// ones. On failure, tell the leader where to back up to.
 	if args.PrevLogIndex > rf.lastLogIndex() {
@@ -93,11 +103,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictIndex = rf.lastLogIndex() + 1
 		return
 	}
-	if term := rf.log[args.PrevLogIndex].Term; term != args.PrevLogTerm {
+	if term := rf.termAt(args.PrevLogIndex); term != args.PrevLogTerm {
 		// Point at the first entry of the conflicting term so the leader
 		// can skip the whole term.
 		first := args.PrevLogIndex
-		for first > 1 && rf.log[first-1].Term == term {
+		for first > rf.snapIndex+1 && rf.termAt(first-1) == term {
 			first--
 		}
 		reply.ConflictTerm = term
@@ -111,10 +121,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	changed := false
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
-		if idx <= rf.lastLogIndex() && rf.log[idx].Term == entry.Term {
+		if idx <= rf.lastLogIndex() && rf.termAt(idx) == entry.Term {
 			continue
 		}
-		rf.log = append(rf.log[:idx:idx], args.Entries[i:]...)
+		pos := idx - rf.snapIndex
+		rf.log = append(rf.log[:pos:pos], args.Entries[i:]...)
 		changed = true
 		break
 	}

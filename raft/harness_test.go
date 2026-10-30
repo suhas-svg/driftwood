@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"sync"
 	"testing"
@@ -22,9 +24,25 @@ type cluster struct {
 	applied    []map[int]any // per node: log index -> command it applied there
 	applyErr   string        // first safety violation seen by the apply checker
 	start      time.Time
+
+	// When nonzero, each node acts like a service that snapshots its state
+	// every snapshotEvery applied entries.
+	snapshotEvery int
+	installed     []int // per node: snapshots received from a leader
+}
+
+// snapshotCluster is a cluster whose nodes snapshot every 10 entries.
+func snapshotCluster(t *testing.T, n int, reliable bool) *cluster {
+	t.Helper()
+	return newClusterOpts(t, n, reliable, 10)
 }
 
 func newCluster(t *testing.T, n int, reliable bool) *cluster {
+	t.Helper()
+	return newClusterOpts(t, n, reliable, 0)
+}
+
+func newClusterOpts(t *testing.T, n int, reliable bool, snapshotEvery int) *cluster {
 	t.Helper()
 	c := &cluster{
 		t:          t,
@@ -36,6 +54,9 @@ func newCluster(t *testing.T, n int, reliable bool) *cluster {
 		applyChs:   make([]chan ApplyMsg, n),
 		applied:    make([]map[int]any, n),
 		start:      time.Now(),
+
+		snapshotEvery: snapshotEvery,
+		installed:     make([]int, n),
 	}
 	if !reliable {
 		c.net.SetDropRate(0.1)
@@ -59,7 +80,12 @@ func (c *cluster) startNode(i int) {
 	persister := c.persisters[i]
 	applyCh := make(chan ApplyMsg, 1000)
 	c.applyChs[i] = applyCh
-	c.applied[i] = map[int]any{} // a restarted node replays its log from the start
+	// Like a real service, a restarted node loads its snapshot from disk,
+	// and Raft replays the log from just after it.
+	c.applied[i] = map[int]any{}
+	if snap := persister.ReadSnapshot(); len(snap) > 0 {
+		c.applied[i] = decodeSnapshot(snap)
+	}
 	c.mu.Unlock()
 
 	peers := make([]Peer, c.n)
@@ -73,7 +99,36 @@ func (c *cluster) startNode(i int) {
 	c.mu.Unlock()
 	c.net.Register(i, rf)
 
-	go c.checkApplies(i, applyCh)
+	go c.checkApplies(i, applyCh, rf)
+}
+
+// The harness's snapshot format: the command at every index up to the last.
+type harnessSnapshot struct {
+	Commands []any // Commands[k] is the command at index k+1
+}
+
+func encodeSnapshot(applied map[int]any, through int) []byte {
+	s := harnessSnapshot{Commands: make([]any, through)}
+	for k := range s.Commands {
+		s.Commands[k] = applied[k+1]
+	}
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(s); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+func decodeSnapshot(data []byte) map[int]any {
+	var s harnessSnapshot
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&s); err != nil {
+		panic(err)
+	}
+	applied := make(map[int]any, len(s.Commands))
+	for k, cmd := range s.Commands {
+		applied[k+1] = cmd
+	}
+	return applied
 }
 
 // crash kills node i. Its persister survives for a later startNode.
@@ -104,22 +159,79 @@ func (c *cluster) running(i int) bool { return c.node(i) != nil }
 
 // checkApplies records what node i applies and checks the two safety rules
 // the service depends on: entries arrive in index order with no gaps, and no
-// two nodes ever apply different commands at the same index.
-func (c *cluster) checkApplies(i int, ch chan ApplyMsg) {
+// two nodes ever apply different commands at the same index. Snapshots count
+// as applying every index they cover.
+func (c *cluster) checkApplies(i int, ch chan ApplyMsg, rf *Raft) {
 	for m := range ch {
-		if !m.CommandValid {
-			continue
-		}
 		c.mu.Lock()
 		if c.applyChs[i] != ch {
 			c.mu.Unlock()
 			continue // from a crashed incarnation of this node
 		}
-		if err := c.checkApplyLocked(i, m); err != "" && c.applyErr == "" {
+		var err string
+		var snap []byte
+		switch {
+		case m.SnapshotValid:
+			err = c.checkSnapshotLocked(i, m)
+		case m.CommandValid:
+			err = c.checkApplyLocked(i, m)
+			if err == "" && c.snapshotEvery > 0 && m.CommandIndex%c.snapshotEvery == 0 {
+				snap = encodeSnapshot(c.applied[i], m.CommandIndex)
+			}
+		}
+		if err != "" && c.applyErr == "" {
 			c.applyErr = err
 		}
 		c.mu.Unlock()
+
+		// Outside c.mu: Snapshot takes rf.mu, and nothing may wait on c.mu
+		// while holding rf.mu.
+		if snap != nil {
+			rf.Snapshot(m.CommandIndex, snap)
+		}
 	}
+}
+
+// checkSnapshotLocked installs a snapshot from the leader on node i, after
+// checking that it agrees with what every node has applied.
+func (c *cluster) checkSnapshotLocked(i int, m ApplyMsg) string {
+	snap := decodeSnapshot(m.Snapshot)
+	if len(snap) != m.SnapshotIndex {
+		return fmt.Sprintf("node %d got a snapshot through %d holding %d entries", i, m.SnapshotIndex, len(snap))
+	}
+	for idx, cmd := range snap {
+		for j, log := range c.applied {
+			if other, ok := log[idx]; ok && other != cmd {
+				return fmt.Sprintf("index %d: snapshot on node %d has %v but node %d applied %v",
+					idx, i, cmd, j, other)
+			}
+		}
+	}
+	if last := len(c.applied[i]); last > m.SnapshotIndex {
+		return fmt.Sprintf("node %d got a snapshot through %d after applying through %d", i, m.SnapshotIndex, last)
+	}
+	c.applied[i] = snap
+	c.installed[i]++
+	return ""
+}
+
+// installedSnapshots is how many snapshots node i has received from a leader.
+func (c *cluster) installedSnapshots(i int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.installed[i]
+}
+
+// maxRaftStateSize is the largest persisted Raft state (log, term, vote)
+// across nodes, in bytes.
+func (c *cluster) maxRaftStateSize() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	size := 0
+	for _, p := range c.persisters {
+		size = max(size, p.RaftStateSize())
+	}
+	return size
 }
 
 func (c *cluster) checkApplyLocked(i int, m ApplyMsg) string {

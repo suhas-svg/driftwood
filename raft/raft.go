@@ -27,7 +27,9 @@ type ApplyMsg struct {
 	CommandIndex int
 	CommandTerm  int
 
-	// Used once snapshots are implemented.
+	// A snapshot from the leader, replacing all state up to SnapshotIndex.
+	// It arrives in order with commands: everything before it has index at
+	// most SnapshotIndex, everything after it is SnapshotIndex+1 onward.
 	SnapshotValid bool
 	Snapshot      []byte
 	SnapshotTerm  int
@@ -70,13 +72,21 @@ type Raft struct {
 	// Persistent state on all servers (Figure 2). Call persist() after
 	// changing any of these and before replying to the RPC that changed them.
 	currentTerm int
-	votedFor    int        // -1 when no vote cast in currentTerm
-	log         []LogEntry // log[0] is a sentinel with Term 0; real entries start at index 1
+	votedFor    int // -1 when no vote cast in currentTerm
+
+	// The log, minus whatever a snapshot replaced. log[0] stands in for the
+	// snapshot: it sits at index snapIndex and holds the term of the last
+	// entry the snapshot covers (0 and 0 before any snapshot). Use entry,
+	// termAt, and lastLogIndex rather than indexing log directly.
+	log       []LogEntry
+	snapIndex int
+	snapshot  []byte // the service's state as of snapIndex
 
 	// Volatile state on all servers.
-	commitIndex int
-	lastApplied int
-	applyCond   *sync.Cond // signaled when commitIndex advances; uses rf.mu
+	commitIndex     int
+	lastApplied     int
+	applyCond       *sync.Cond // signaled when there is something to apply; uses rf.mu
+	pendingSnapshot bool       // a snapshot from the leader waits for the applier
 
 	// Volatile state on leaders, reinitialized after each election.
 	nextIndex  []int
@@ -89,7 +99,9 @@ type Raft struct {
 
 // Make creates a Raft node. peers[me] is this node. persister holds any state
 // saved before a crash. Committed entries are delivered on applyCh in order.
-// Make must return quickly; long-running work belongs in goroutines.
+// A restarted service should load persister.ReadSnapshot() itself; Raft then
+// delivers entries from just after the snapshot. Make must return quickly;
+// long-running work belongs in goroutines.
 func Make(peers []Peer, me int, persister *Persister, applyCh chan<- ApplyMsg) *Raft {
 	rf := &Raft{
 		peers:     peers,
@@ -101,7 +113,7 @@ func Make(peers []Peer, me int, persister *Persister, applyCh chan<- ApplyMsg) *
 		state:     Follower,
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 	rf.resetElectionTimer()
 
 	go rf.ticker()
@@ -150,16 +162,30 @@ func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for !rf.killed() {
-		if rf.lastApplied >= rf.commitIndex {
+		var msg ApplyMsg
+		switch {
+		case rf.pendingSnapshot:
+			// InstallSnapshot already moved lastApplied to snapIndex. Every
+			// entry sent before this had a lower index, so order holds.
+			rf.pendingSnapshot = false
+			msg = ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  rf.log[0].Term,
+				SnapshotIndex: rf.snapIndex,
+			}
+		case rf.lastApplied < rf.commitIndex:
+			rf.lastApplied++
+			e := rf.entry(rf.lastApplied)
+			msg = ApplyMsg{
+				CommandValid: true,
+				Command:      e.Command,
+				CommandIndex: rf.lastApplied,
+				CommandTerm:  e.Term,
+			}
+		default:
 			rf.applyCond.Wait()
 			continue
-		}
-		rf.lastApplied++
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.lastApplied].Command,
-			CommandIndex: rf.lastApplied,
-			CommandTerm:  rf.log[rf.lastApplied].Term,
 		}
 		rf.mu.Unlock()
 		rf.applyCh <- msg
@@ -276,5 +302,17 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.persist()
 }
 
-func (rf *Raft) lastLogIndex() int { return len(rf.log) - 1 }
+// Log index helpers. Valid indexes run from snapIndex (the snapshot's
+// stand-in entry) through lastLogIndex. Caller holds rf.mu.
+
+func (rf *Raft) lastLogIndex() int { return rf.snapIndex + len(rf.log) - 1 }
 func (rf *Raft) lastLogTerm() int  { return rf.log[len(rf.log)-1].Term }
+
+func (rf *Raft) entry(index int) LogEntry { return rf.log[index-rf.snapIndex] }
+func (rf *Raft) termAt(index int) int     { return rf.entry(index).Term }
+
+// entriesFrom returns a copy of the entries from index to the end. It copies
+// because RPCs are encoded after rf.mu is released, while the log may change.
+func (rf *Raft) entriesFrom(index int) []LogEntry {
+	return append([]LogEntry(nil), rf.log[index-rf.snapIndex:]...)
+}

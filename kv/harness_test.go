@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,19 +23,28 @@ type cluster struct {
 	persisters []*raft.Persister
 	clerks     int
 
-	start   time.Time
+	maxRaftState int // passed to every server; 0 disables snapshots
+
+	clock   atomic.Int64 // orders call and return events; see now
 	history []porcupine.Operation
 }
 
 func newCluster(t *testing.T, n int, reliable bool) *cluster {
 	t.Helper()
+	return newSnapshotCluster(t, n, reliable, 0)
+}
+
+// newSnapshotCluster makes servers snapshot whenever their Raft state reaches
+// maxRaftState bytes.
+func newSnapshotCluster(t *testing.T, n int, reliable bool, maxRaftState int) *cluster {
+	t.Helper()
 	c := &cluster{
-		t:          t,
-		n:          n,
-		net:        sim.New(time.Now().UnixNano()),
-		servers:    make([]*Server, n),
-		persisters: make([]*raft.Persister, n),
-		start:      time.Now(),
+		t:            t,
+		n:            n,
+		net:          sim.New(time.Now().UnixNano()),
+		servers:      make([]*Server, n),
+		persisters:   make([]*raft.Persister, n),
+		maxRaftState: maxRaftState,
 	}
 	if !reliable {
 		c.net.SetDropRate(0.1)
@@ -64,7 +74,7 @@ func (c *cluster) startServer(i int) {
 	for j := range peers {
 		peers[j] = c.net.End(i, j)
 	}
-	srv := StartServer(peers, i, p)
+	srv := StartServer(peers, i, p, c.maxRaftState)
 
 	c.mu.Lock()
 	c.servers[i] = srv
@@ -87,6 +97,33 @@ func (c *cluster) crash(i int) {
 	c.mu.Lock()
 	c.persisters[i] = c.persisters[i].Copy()
 	c.mu.Unlock()
+}
+
+// checkLogSize fails if any server's Raft state stays well past the snapshot
+// threshold. Some slack is normal, because entries keep arriving while a
+// snapshot is taken. A follower that is catching up can also briefly hold a
+// backlog of entries it has not applied yet, which no snapshot can remove, so
+// give it a few seconds to settle.
+func (c *cluster) checkLogSize() {
+	c.t.Helper()
+	limit := 8 * c.maxRaftState
+	var worst, server int
+	for attempt := 0; attempt < 30; attempt++ {
+		worst = 0
+		c.mu.Lock()
+		for i, p := range c.persisters {
+			if size := p.RaftStateSize(); size > worst {
+				worst, server = size, i
+			}
+		}
+		c.mu.Unlock()
+		if worst <= limit {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	c.t.Fatalf("server %d's Raft state is %d bytes after 3s, limit is %d; snapshots are not trimming the log",
+		server, worst, limit)
 }
 
 func (c *cluster) running(i int) bool {
@@ -155,7 +192,13 @@ func (ck *clerk) Append(key, value string) {
 	ck.c.record(ck.index, modelInput{Op: OpAppend, Key: key, Value: value}, "", start)
 }
 
-func (c *cluster) now() int64 { return time.Since(c.start).Nanoseconds() }
+// now returns a timestamp for a call or return event. It is a counter, not
+// a clock: Porcupine only needs the real-time order of events, and a counter
+// gives every event a distinct, correctly ordered value. Wall-clock time does
+// not. On Windows it ticks only every ~0.6ms, so fast operations from one
+// client get identical timestamps, which Porcupine must treat as concurrent.
+// That turned easy histories into exponential searches.
+func (c *cluster) now() int64 { return c.clock.Add(1) }
 
 func (c *cluster) record(client int, in modelInput, out string, start int64) {
 	end := c.now()
@@ -178,8 +221,9 @@ func (c *cluster) checkLinearizable() {
 	history := append([]porcupine.Operation(nil), c.history...)
 	c.mu.Unlock()
 
-	// Most histories check in milliseconds, but about 1 in 50 crash-test
-	// histories takes tens of seconds (still Ok). Give those room to finish.
+	// With counter timestamps (see now), histories check in milliseconds.
+	// A timeout means the search blew up, which is a finding in itself, so
+	// it fails the test instead of passing silently.
 	res, info := porcupine.CheckOperationsVerbose(kvModel, history, 60*time.Second)
 	switch res {
 	case porcupine.Illegal:
@@ -191,7 +235,7 @@ func (c *cluster) checkLinearizable() {
 		}
 		c.t.Fatalf("history of %d operations is not linearizable", len(history))
 	case porcupine.Unknown:
-		c.t.Logf("linearizability check timed out on %d operations; treating as passing", len(history))
+		c.t.Fatalf("linearizability check timed out on %d operations", len(history))
 	}
 }
 

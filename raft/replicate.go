@@ -11,16 +11,21 @@ func (rf *Raft) broadcastAppendEntries() {
 }
 
 // sendEntriesTo sends one AppendEntries to server, starting at its nextIndex,
-// and handles the reply in the background. Caller holds rf.mu.
+// and handles the reply in the background. If the entries it needs were
+// already replaced by a snapshot, it sends the snapshot instead.
+// Caller holds rf.mu.
 func (rf *Raft) sendEntriesTo(server int) {
 	prev := rf.nextIndex[server] - 1
+	if prev < rf.snapIndex {
+		rf.sendSnapshotTo(server)
+		return
+	}
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderID:     rf.me,
 		PrevLogIndex: prev,
-		PrevLogTerm:  rf.log[prev].Term,
-		// Copy: the RPC is encoded after we unlock, while the log may change.
-		Entries:      append([]LogEntry(nil), rf.log[prev+1:]...),
+		PrevLogTerm:  rf.termAt(prev),
+		Entries:      rf.entriesFrom(prev + 1),
 		LeaderCommit: rf.commitIndex,
 	}
 
@@ -76,7 +81,7 @@ func (rf *Raft) handleAppendReply(server int, args *AppendEntriesArgs, reply *Ap
 // entry is committed too. Caller holds rf.mu and is the leader.
 func (rf *Raft) advanceCommitIndex() {
 	for n := rf.lastLogIndex(); n > rf.commitIndex; n-- {
-		if rf.log[n].Term != rf.currentTerm {
+		if rf.termAt(n) != rf.currentTerm {
 			// Terms only decrease going backward, so nothing earlier qualifies.
 			return
 		}
@@ -95,13 +100,12 @@ func (rf *Raft) advanceCommitIndex() {
 }
 
 // lastIndexOfTerm returns the index of our last entry with the given term, or
-// -1 if we have none. Caller holds rf.mu.
+// -1 if we have none outside the snapshot. Caller holds rf.mu.
 func (rf *Raft) lastIndexOfTerm(term int) int {
-	for i := rf.lastLogIndex(); i > 0; i-- {
-		if rf.log[i].Term == term {
+	for i := rf.lastLogIndex(); i > rf.snapIndex; i-- {
+		if t := rf.termAt(i); t == term {
 			return i
-		}
-		if rf.log[i].Term < term {
+		} else if t < term {
 			break
 		}
 	}
